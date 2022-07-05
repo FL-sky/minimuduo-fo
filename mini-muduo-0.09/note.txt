@@ -1,0 +1,101 @@
+1 原书中对Timer的介绍分布在两个地方，<<7.8定时器>>和<<8.2 TimerQueue定时器>>，
+作者在7.82节总结了选择timerfd来作为多线程服务器程序的定时器的原因：
+
+    1 sleep(3)/alarm(2)/usleep(3)在实现时有可能用了SIGALRM信号， 
+    在多线程程序中处理信号是个相当麻烦的事情，应当尽量避免
+
+    2 nanosleep(2)和clock_nanosleep(2)是线程安全的，
+    但是在非阻塞网络编程中，绝对不能用让线程挂起的方式来等待一段时间，这样一来程序会失去响应。
+    正确的做法是注册一个时间回调函数。
+
+    3 getitimer(2)和timer_create(2)也是用信号来deliver超时，在多线程程序中也会有麻烦。
+
+    4 timerfd_create(2)把时间变成了一个文件描述符，该文件描述符在定时器超时的那一刻变得刻度，
+    这样就能很方便的融入select(2)/poll(2)框架中，用统一的方式来处理IO时间和超时事件。
+
+    5 传统的Reactor利用select(2)/poll(2)/epoll(4)/的timeout来实现定时功能，
+    但poll(2)/和epoll_wait(2)的定时精度只有毫秒，远低于timerfd_settime(2)的定时精度。
+
+
+2 有必要先看看最进本的timerfd是如何工作的，
+
+注意下面粘贴代码/行数都是mini-muduo里的，而非muduo，当然了muduo的实现原理是一样的。
+
+在我们的系统里，使用timerfd作为定时器，实际用到了下面5个函数，其中前两个为timer文件描述专用，后面三个可以用在多种文件描述符上。
+
+int timerfd_create(int clockid, int flags) //创建一个定时器文件
+int timerfd_settime(int ufd, int flags, const struct itimerspec * utmr, struct itimerspec * otmr); //设置新的超时时间，并开始计时
+int epoll_ctl(_epollfd, EPOLL_CTL_ADD, fd, &ev) //将timer文件描述符加入到epoll检测
+int epoll_wait(_epollfd, _events, MAX_EVENTS, -1); //在epoll上等待各种文件描述符事件
+int close(int fd); //释放掉文件描述符
+
+这5个函数列出的顺序正好也是实际使用定时器过程中调用的顺序。首先通过timerfd_create创建一个Timer文件描述符，
+然后通过timerfd_settime来设置超时时间，之后将Timer文件描述符加入到epoll的检测，程序通过一个循环等待在epoll_wait上，
+因为没有Timer到时而导致阻塞。一旦定时器到时，epoll_wait就会返回，我们就可以进行相关处理。
+(在muduo/mini-muduo里，注册到epoll描绘符和接收epoll_wait()通知都是通过Channel来实现的)
+
+
+3 看用户是如何使用Timer的，用户要使用网络库的定时器，必须通过EventLoop。EventLoop有三个接口暴露了Timer相关的操作
+
+int runAt(Timestamp when, IRun* pRun); //在指定的某个时刻调用函数
+int runAfter(double delay, IRun* pRun); //等待一段时间后，调用函数
+int runEvery(double interval, IRun* pRun); //以固定的时间间隔反复调用函数
+void cancelTimer(int timerfd); //关闭一个Timer
+
+前3个函数的返回值int是用来唯一确定一个定时器的ID，当需要关闭某个Timer的时候，将ID传递给cancelTimer函数即可。
+IRun是一个回调接口，在mini-muduo里几乎所有的回调都是通过IRun来完成的。
+runAt的第一个参数是一个代表时间的Timestamp对象，runAfter和runEvery的第一个参数都是以秒为单位的。
+
+4 详细分析下Timer是怎么实现的，其实EventLoop里只有一个Timer文件描述符，
+当用户通过上面的3个接口向EventLoop添加的所有定时器，实际都工作在同一个timerfd上，这个是怎么做到的呢？
+我们来跟踪一下EventLoop::runAt()的实现
+
+......
+......
+
+几个实现细节：
+
+    细节1：注意定时器容器的选择，也就是TimerQueue里的_timers成员变量，muduo选择了使用二叉搜索树，
+    也就是std::map或者std::set，这两者二选一的过程中，作者最终选择了set，
+    因为同一个时间点下可能有多个定时器，所以直接使用map是不合适的，
+    因为一个pair<Timestamp, Timer*>代表着一个时间，
+    如果直接用map<Timestamp, *Timer>只能保证一个时间点下只对应一个Timer*，这不符合要求，
+    所以作者使用了稍微复杂的类型set<pair<Timestamp, Timer*>> 作为存储定时器的容器。
+    mini-muduo在返回值方面进行了简化，没有像muduo一样返回一个TimerId，而是直接返回了int，其实就是Timer对象的地址。
+    由于在同一个进程里，对象地址是不可能相同的，这样就简单粗暴解决了同样时间下多个定时器的问题。
+
+    细节2：定时器的插入操作，使用insert加入到set后，就自动按照Timestamp排序了，
+    Iterator的begin的first就是所有定时器里最早的那一个。
+    如果要插入新的定时器，有个重要的标志，就是earliestTimerChanged，重要条件作为判断，
+    如果(it == end || when < it.begin.first)条件满足就代表标志改变了。
+
+    细节3：注意Timestamp的运算符重载
+
+ 57 bool operator<(Timestamp l, Timestamp r)
+ 58 {
+ 59     return l.microSecondsSinceEpoch() < r.microSecondsSinceEpoch();
+ 60 }
+ 61 
+ 62 bool operator==(Timestamp l, Timestamp r)
+ 63 {
+ 64     return l.microSecondsSinceEpoch() == r.microSecondsSinceEpoch();
+ 65 }
+    细节4：Timestamp::tostring()方法，要打印64位整数，在32/64平台上可以使用下面的方法
+
+#include <inttypes.h>
+//跨平台打印方法
+printf("%" PRId64 "\n", value);
+// 相当于64位的：
+printf("%" "ld" "\n", value);
+// 或32位的：
+printf("%" "lld" "\n", value);
+注意要使用PRId64，还要做个小处理，使用宏来包裹#include<inttypes.h>，所以Timestamp里的代码就写成了下面的样子，有点奇怪。
+  5 #define __STDC_FORMAT_MACROS
+  6 #include <inttypes.h>
+  7 #undef __STDC_FORMAT_MACROS
+关于__STDC_FORMAT_MACROS宏的问题，可以阅读下后面这篇文章http://blog.163.com/guixl_001/blog/static/4176410420121021111117987/
+    细节5：Interval和expiration的名字应该是来源于man timerfd_settime的i解释
+    细节6：修改IRun接口，原有的不满足要求，因为不能保存调用参数。
+    同时由于修改了IRun接口，所以在EvenrLoop里添加了Runner类，用于存储回调和参数，原始的_pendingFunctors只能存储回调，参数没地方存。
+    细节7：由于还没太读懂muduo的cancelTimers队列所以本版本暂时不实现了。
+    

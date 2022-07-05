@@ -1,0 +1,60 @@
+程序说明：
+
+1 使用epoll的三个函数
+
+int epoll_create(int size) 创建一个epoll文件描述符
+
+int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event)
+将socket描述符加入/移出epoll监听，修改注册事件
+
+int epoll_wait(int epfd, struct epoll_event * events, int maxevents, int timeout)
+在epoll描述符上等待事件的发生，并获得事件
+
+2 epoll编程最基本模型
+
+伪代码
+
+1    epollfd = epoll_create(...)                     //创建epoll描述符
+2    listenfd = socket(...)                          //创建用于端口监听的socket
+3    bind(listenfd ...)                              //绑定
+4    listen(listenfd ...)                            //开始在端口监听
+5    epoll_ctl(epollfd, EPOLL_CTL_ADD, listenfd...)  //将listenfd加入epoll描述符监听
+6    for(;;)                                         //无限循环
+7    {
+8       n = epoll_wait(...)                         //等待epoll描述符的事件发生
+9       for(0 ~ n)                                  //可能有多个读写事件发生，遍历所有事件
+10      {
+11          if(events[i].data.fd == listenfd)       //通过发生事件的socket描述符确认有新链接，
+12          {                                       //而非已经打开的socket的读写事件
+13              connfd = accpet(...)                //accept新连接为connfd
+14              epoll_ctl(...)                      //connfd加入epoll监听,像上面listenfd一样
+15          }
+16          else if(events[i].events & EPOLLIN)     //发生事件的socket不是listenfd而是connfd
+17          {                                       //且事件集里有EPOLLIN表明有数据要读取
+18              n = read(...)                       //读取数据
+19                if(n == 0)                          //读到0字节，需要关闭socket
+20                  close(connfd)                   //close会自动将connfd从epoll监听中删除
+21          }                                       //无需调用epoll_ctl(..EPOLL_CTL_DEL..)
+22          else if(...)                            //其他各种事件处理依次处理
+23          ...    }
+24  }
+
+3 程序非常简陋，虽然能运行，但是问题多多，只处理了读事件，没有输入输出缓冲区，整个代码写在一个巨大的for循环中，这些在后续版本逐一改进。
+4 83行的bzero是从UNP(第一卷P6)里学来的，因为memset的三个参数总是容易搞混。
+
+5 41行和72行虽然只注册了EPOLLIN事件，但是有另外两个事件会自动被注册：EPOLLERR和EPOLLHUP， man epoll_ctl可以看到相关说明。
+
+6 54行和76行根据发生事件的socket描述符结合events里的事件判断应该如何进行下一步处理，如果socket描述符为listenfd，就要accpet新连接，
+否则发生事件的socket就是connfd，需要判断发生了哪些事件，后续调用read还是write，本例只调用了read
+
+7 89行和95行两处调用了close，后续会详细解释原因
+
+    1 read返回-1，且错误码为ECONNRESET。
+
+    2 read返回0。
+
+8 10行和70行将socket设置为no-blocking模式，加入epoll的socket要先设置为no-blocking
+
+9 11行中用于监听端口的listenfd被设置为SO_REUSEADDR
+
+10 cout如果链式链调用有可能发生线程切换导致输出被分割，不过目前例子是单线程，暂时忽略这个问题。

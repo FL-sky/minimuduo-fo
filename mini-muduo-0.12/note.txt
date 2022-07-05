@@ -1,0 +1,136 @@
+mini-muduo v0.12版本，mini-muduo完整可运行的示例可从github下载，
+使用命令git checkout v0.12可切换到此版本，在线浏览此版本到这里
+本版本是个过度版本，只简单引入了线程相关的C++代码，并没有将多线程引入逻辑流程。
+写这篇Blog主要目的是温习一下Linux多线程编程。下一个版本将彻底修改网络IO模块(EventLoop)。本Blog的大部分内容在陈硕的书中均有涉及。
+
+主要介绍5个最重要的类
+
+
+1 Mutex
+
+    下面几个关键点：
+
+    1 使用RAII手法封装mutex的创建，销毁，加锁解锁四个操作。RAII是C++程序员的最佳伴侣。
+
+    2 推荐使用非递归的mutex，缺省即是非递归。对于非递归的mutex，如果书写思路不够清晰，会导致死锁，引起警惕。
+    对于非递归mutex，则会概率出问题，反而更难定位。书中比喻很贴切：“反正是死，不如死的有意义一点，留个全尸让验尸更容易些”。
+
+    3 死锁的两种经典场景
+
+        1 只有一个Mutex，自己锁自己。比如A::x()和A::y()方法都使用了同一个Mutex进行了加锁，单独调用A::x()和A::y()都不会出问题，
+        但是如果A::x()的实现里不小心要调用到A::y()就会发生死锁。
+
+        2 有两个Mutex，互相锁。比如A，B两个线程里分别按照相反的顺序锁住了MutexA和MutexB两个互斥量，像下面这样，会造成典型的死锁。
+        注意并非相反顺序就一定造成死锁，比如执行序列2虽然是相反顺序上锁，但是不会造成死锁。
+        
+
+死锁：  时间递增  -------------->
+
+A线程      lock(MutexA)                           lock(MutexB)
+
+B线程                               lock(MutexB)                         lock(MutexA)
+
+非死锁：时间递增  -------------->
+
+A线程      lock(MutexA)    lock(MutexB)
+
+B线程                                                      lock(MutexB)  lock(MutexA)
+
+
+
+2 Condition
+
+    引用BlockingQueue的实现来说明Condition的使用，BlockingQueue是一个经典的生产者消费者数据结构。
+    dequeue()方法由消费者调用，从集合里取出数据。enqueue()由生产者调用，将数据放入集合。
+
+    Condition的使用有2个关键点：
+    
+     1 必须与mutex一起使用
+
+        该布尔表达式的读写需受此mutex的保护，参考一下pthread_cond_wait()的实现可以更好的理解这一点，
+        pthread_cond_wait()会把下面两个动作作为原子操作来执行 1解锁mutex 2 让线程进入不消耗CPU的睡眠。
+        之后另外的线程调用pthread_cond_noitfy()，wait()等待线程被唤醒 ，此时pthread_cond_wait()还未返回，
+        在wait()函数体里会执行mutex加锁操作，此后wait()返回。
+        （个人推断，这里的唤醒和执行mutex加锁操作并非原子操作，详见后面BlockingQueue节的分析）。
+
+        2 while测试
+
+        while测试是为了解决虚假唤醒(spurious wakeup)。
+        在多核处理器中，某些时候，wait()操作会在没有调用broadcast和signal的情况下被意外唤醒。
+        这种解释听上去很牵强也很奇怪，怎么看都像Linux的一个Bug。
+        这当然不是一个bug，根据wikipedia的解释，出现这种问题的原因是：
+        在某些多核处理器上，制作一个行为可预期的条件变量（condition variable）会明显拖慢所有的条件变量。
+        限于目前没有精力阅读内核源码的情况下，可以这样理解spurious wakeup：它是操作系统在性能和易用性之间妥协的结果，
+        spurious wakeup问题类似于“c语言中数组没有过界检查”这样的问题。
+        现实情况很可能是要牺牲相当的操作系统整体性能（假设10%）来换取一个完美的的条件变量实现，显然这么做是不划算的。
+        wikipedia原话是“Spurious wakeups may sound strange, but on some multiprocessor systems, 
+        making condition wakeup completely predictable might substantially slow all condition variable operations.”。
+        
+
+int dequeue()
+{
+    MutexLockGuard lock(mutex);  --------------------------
+    while(queue.empty())       / 下面是 pthread_cond_wait的实现，1，2是原子过程
+    {                          | 1 pthread_cond_unlock(mutex)
+        cond.wait();    -------| 2 等待...
+    }                          | 3 notify()被调用，本线程被加入就绪队列(不一定立刻获得CPU)
+    int top = queue.front();   \ 4 pthread_cond_lock(mutex)
+    queue.pop_front();           ---------------------------
+    return top;
+}
+void enqueue(int x)
+{
+    MutexLockGuard lock(mutex)
+    queue.push_back(x);
+    cond.notify();
+}
+
+
+3 BlockingQueue
+
+    只有一点要注意，那就是调用notify的时机，并不是当queue的size()从0变到1的时候才调用，
+    而是每次push_back都会调用。按照陈硕的描述，“push 第一个 task 的时候，会唤醒一个消费者。
+    但是这个消费者线程不一定会马上执行，它会进入就绪状态，等待被调度。
+    如果操作系统继续执行生产者线程，push 第二个 task，那么按照你的算法(也就是size()从0变为1时才调用notify())，
+    不会有新的消费者被唤醒。这样一来，在 queue_ 再次变空之前，只有一个消费者醒过来处理 tasks，其余 4 个都在睡大觉。
+    Stevens 的书上只有一个消费者，它的代码不适用于多消费者的情形“。 
+    这里的意思就是说，pthread_cond_wait里的两个操作是不对等的，（1解锁2挂起，是一对原子操作，3唤醒4加锁，不是原子操作），
+    所以当notify通知过来的时候，一个线程被唤醒，加入到可执行队列，但是可能没有被立即执行，
+    由于3唤醒4加锁不是原子操作，如果在3和4之间发生了cpu调度，cpu被派去执行新的生产者线程，
+    这个生产者通过调用enqueue()增加一个可用项，这时发现size() != 1 于是就不通知了，这次通知事件就丢失了！
+
+
+4 Thread
+
+    线程标识符用tid，而不要使用pthread_t，原因如下：
+
+    1 pthread_t 不一定是一个数值类型，也可能是一个结构体，所以无法打印输出pthread_t。
+    因为不知道其确切类型，无法比较pthread_t的大小，因此无法用作关联容器的key。
+    glibc的Pthread实现是把pthread_t用作一个结构体指针，指向一块动态分配的内存，而且这块内存是反复使用的，
+    这造成pthread_t的值很容易重复，像下面的代码。
+    而作为对照的tid是一个小整数，便于输出，tid是递增的，只有经过一段时间递增超过最大值（默认32768）才会重复。
+
+    2 pthread_t 值只在进程内有意义，与操作系统的任务调度之间无法建立有效关系，在/proc文件系统中找不到pthread_t对应的task。
+    而作为对照的tid，可以在/proc中找到对应项，也可以使用top命令直接查看，非常便于程序调试和排错。
+
+    注意，由于gettid是系统调用，为了提高效率，使用__thread变量缓存gettid()。（注，mini-muduo当前v0.12版本尚未添加此缓存功能）
+    
+
+//重复phread_t示例
+in main()
+{
+    pthread_t t1 t2;
+    pthread_create(&t1, NULL, htreadFunc, NULL);
+    printf(%lx\n", t1);
+    pthread_jion(t1, NULL);
+    pthread_create(&2, NULL, threadFunc, NULL);
+    printf("%lx\n", t2);
+    pthread_jion(t2, NULL);
+    return 0;
+}
+
+5 ThreadPool
+
+    这是个简化的线程池里，直接使用了上面介绍的BlockingQueue作为生产者/消费者容器，
+    这个线程池和线程函数一样，只能启动不能关闭，为了使代码简化，我只保留了最重要的部分。
+

@@ -1,0 +1,46 @@
+1 reactor的类图结构：.
+
+2 主要类介绍:
+
+Handles
+
+        操作系统管理的某种资源，比如socket描述符，Synchronous Event Demultiplexer可以在多个Handle上等待事件的发生，
+        比如等待socket的读写事件。
+
+Synchronous Event Demultiplexer
+
+        用来在多个Handle上等待事件发生，在Linux平台上就是select/poll/epoll函数了。
+
+Initiation Dispatcher
+
+提供给应用程序使用，应用程序借助Initiation Dispatcher可以在Handle上注册或者注销监听。
+
+Event Handler
+
+这是一个接口，应用程序实现满足这个接口的类，然后通过Initiation Dispatcher将这个类注册到Handle上
+
+Concrete Event Handler
+
+        这是应用程序实现的，满足Event Handler接口的类，通常来说，服务器程序会有两个最典型的Concrete Event Handler，
+        原文中一个叫做Logging Acceptor，
+        另一个叫做Logging Handler，Logging Acceptor负责创建并且注册Logging Handlers，Logging Handler处理读写事件。
+
+
+3 类之间的协作关系：
+
+1 当应用程序注册一个Concrete Event Handler到Initiation Dispatcher的时候，应用程序指定关注的事件类型
+
+2 Initiation Dispatcher需要每个Event Handler回传它内部的Handle
+
+3 当所有的Event Handler注册好后，应用程序调用handle_events来启动事件循环，
+此时Initiation Dispatcher使用Synchronous Event Demultiplexer在Handles集合上等待。
+
+4 当某个Handle上有事件发生时，Synchronous Event Demultiplexer通知Initiation Dispatcher
+
+5 Initiation Dispatcher使用Handler作为key来找到某个Event Handler
+
+6 Initiation Dispatcher调用Event Handler的handle_event()方法
+
+
+4 时序图.
+

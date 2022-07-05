@@ -1,0 +1,89 @@
+mini-muduo v0.11版本，修整代码版本。mini-muduo完整可运行的示例可从github下载，使用命令git checkout v0.11可切换到此版本，在线浏览此版本到这里。
+
+这个版本的改动不大，主要修改了命名规范，可读性以及32-bit/64-bit问题，借着这个版本重点分析一下muduo里的三个文件描述符。
+
+
+命名规范
+
+1 Channel::getSocketfd() 改为Channel::getfd() 
+
+Channel一开始只是用来包装socket描述符的，但是后面eventfd和timerfd都加入进来，所以改名为getfd()才合适。
+2 修改了几个Channel成员变量的命名，直接用Channel所包装的文件描述符命名，更直观，比如下面这几个。
+
+_wakeupChannel => _pEventfdChannel
+
+_pChannel=>_pSocketChannel
+
+_pAcceptChannel=>_pSocketAChannel
+
+可读性
+
+去掉了只有在多线程版本里才需要的wakeup调用(位于EventLoop::queueLoop)
+
+32-bit/64-bit
+
+把定时器ID的数据类型从int改为long
+
+三种文件描述符
+Muduo里有三个重要的文件描述符，1 socket fd 2 event fd 3 timer fd，
+这三个文件描述符外加一个epoll循环构成了整个程序运行的框架。
+可以看出，muduo库作者有意把各种需求都整合到epoll里，后续甚至连任务在多个线程间的分发都交给了epoll描述符。
+我们只要明白了muduo的这种独特设计思路，就几乎理解了其完整工作流程。
+
+[三种文件描述符.png]
+
+图示表明了这三个文件描述符在epoll_wait中的执行流程。
+主流程里有一个while循环(位于EventLoop.cc中)，不断调用epoll_wait来尝试获得新的通知，
+三种描述符都已经被加入epoll_wait监听，所以三个描述符上只要有read类事件发生，epoll_wait会返回，
+对应的Channel::handleRead()会被调用。三种描述符有各自的处理流程，handleRead处理完毕后，while循环还未完结，
+需要继续调用doPendingFunctors(位于EventLoop.cc中)来执行异步待处理的回调，之后完成本次循环。
+
+注意虚线部分为多线程版本才需要的代码，在当前版本可忽略。
+
+
+1 socket fd
+作为网络IO的核心，socket描述符的作用不必多说，所有的网络数据输入输出都通过它来完成。
+(之前的介绍可参看 链接 <<从epoll构建muduo-5 加入Acceptor和TcpConnection>>)。
+有两种socket描述符，一种用来listen新的连接，另一种用来读写数据，这里我们只关心后者。
+对读写数据的socket(位于TcpConnection.cc中)来说，其handleRead，或者更直接点是用户回调里的onMessage()，
+也就是服务器收到一个协议后的处理逻辑。可能会有下面这些操作，比如”读写数据库“或者"触发一个异步调用"或者"开启定时器做事情"等等，
+由于后两个操作会与eventfd/timerfd产生关联，所以这里只画出了这两个操作。
+这两个操作分别对应于EventLoop::queueLoop方法和TimerQueue::addTimer方法。
+
+2 event fd
+提供了一个异步调用接口，这个异步调用可能来自本线程(比如本线程的Timer),
+或者来自其他线程(多线程的章节涉及，先忽略)，之前的介绍参看 【链接】 <<从epoll构建muduo-9 加入onWriteComplate回调和Buffer>>
+
+【三种文件描述符[2 event fd].png】
+
+异步调用过程如下
+
+    1 通过调用EventLoop::queryLoop送入一个IRun*和一个void*参数，后续当异步调用发生时，参数会被重新送给IRun。
+    2 EventLoop::queryLoop的实现做了一件事
+
+        1把一个IRun放到pending vector(即图中vectorA)
+
+    3 socket的handleRead()之后调用doPendingFunctors，这里会遍历pending vector，并触发我们刚放入的IRun(void*)，本次epoll循环结束。
+
+3 timerfd
+
+实现了定时器功能。(之前的介绍参看 连接 <<从epoll构建muduo-10 Timer定时器>>)
+
+[三种文件描述符[3 timerfd].png]
+
+1 添加定时器的入口TimerQueue::addTimer，这是一个异步操作，是通过EventLoop::queryLoop实现的。
+2 按照刚才讲的event fd处理流程，异步操作会在之后的doPendingFunctors触发，被触发的将是TimerQueue::doAddTimer函数。
+3 TimerQueue::doAddTimer做下面两件事
+
+    1将Timer插入定时器集合中(vectorB)
+
+    2找出这个定时器是否比已知定时器里最早要发生的定时器还早，如果是，则调用resetTimerfd()将timer fd往更早修改。
+
+4 当Timerfd对应的定时器时间到后，epoll_wait会返回，这导致timer fd的handleRead()被调用。handleRead做了下面的事情
+    1 遍历定时器列表，将当前事件之前应该触发的调用全部调用一次IRun
+
+    2 找到已经触发过，但是需要重复执行的定时器，将其后延一个时间单位，插入到定时器回调集合中(VectorB)
+
+    3 从定时器回调集合(vectorB)里找出最近的一个未执行的条目，然后设置timer fd到这个时间。
+
+5 定时器完整过程处理完毕。
